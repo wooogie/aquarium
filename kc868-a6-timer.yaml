@@ -1,0 +1,558 @@
+################################################################################
+# ESPHome – KinCony KC868-A6  |  Interval Timer for Relay 1 & 2
+# ---------------------------------------------------------------------------
+# All timer parameters are configurable via the built-in web interface
+# (http://<device-ip>) – no Home Assistant required.
+#
+# Parameters exposed on the web page:
+#   • ON Duration  (minutes, 0.5 – 120, step 0.5)
+#   • OFF Duration (minutes, 0.5 – 120, step 0.5)
+#   • Daytime Start (hour 0 – 23)
+#   • Daytime End   (hour 0 – 23)
+#   • Timer Enable  (on/off toggle)
+#
+# Relay 3–6 remain as standalone manual switches on the web page.
+################################################################################
+
+substitutions:
+  device_name: kc868-a6-timer
+  friendly_name: KC868-A6 Timer
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  comment: "Interval timer for relay 1 & 2 with daytime window"
+  on_boot:
+    priority: 600              # runs after all components are initialised
+    then:
+      # Seed the ESP32 system clock from the battery-backed hardware RTC
+      # immediately at boot so the timer works correctly even before WiFi
+      # and NTP become available.
+      - ds1307.read_time:
+          id: rtc_time
+
+esp32:
+  variant: esp32
+  framework:
+    type: esp-idf            # recommended for KC868-A6
+
+################################################################################
+# WiFi  (credentials in secrets.yaml)
+################################################################################
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Fallback AP – active when the main WiFi is unreachable.
+  # Connect to it and open 192.168.4.1 to set up WiFi.
+  ap:
+    ssid: "${friendly_name} Setup"
+    password: "kc868setup"
+
+captive_portal:            # redirect to setup portal while on fallback AP
+
+################################################################################
+# Logging & OTA update
+################################################################################
+logger:
+  level: INFO
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+################################################################################
+# Built-in web server  –  the "homepage" for controlling the timer
+################################################################################
+web_server:
+  port: 80
+  version: 3               # modern card-based UI
+
+################################################################################
+# I²C bus  (PCF8574 I/O expanders + DS1307 RTC all share this bus)
+################################################################################
+i2c:
+  sda: GPIO4
+  scl:
+    number: GPIO15
+    ignore_strapping_warning: true
+  scan: true
+  frequency: 100kHz
+
+################################################################################
+# PCF8574 I/O expanders
+#   0x22 – 6 digital inputs
+#   0x24 – 6 relay outputs
+################################################################################
+pcf8574:
+  - id: exp_inputs
+    address: 0x22
+  - id: exp_outputs
+    address: 0x24
+
+################################################################################
+# Time
+#   Primary:  SNTP over WiFi  (syncs once connected)
+#   Backup:   DS1307 RTC  (written after every NTP sync; read on boot)
+################################################################################
+time:
+  - platform: sntp
+    id: ntp_time
+    timezone: "Europe/Zurich"
+    servers:
+      - 0.pool.ntp.org
+      - 1.pool.ntp.org
+      - 2.pool.ntp.org
+    on_time_sync:
+      then:
+        - logger.log: "NTP synced – persisting to DS1307 RTC"
+        - ds1307.write_time:
+            id: rtc_time
+
+  - platform: ds1307
+    id: rtc_time
+    # Periodic polling is disabled. The DS1307 hardware RTC is:
+    #   READ  → on every boot (via on_boot above) to seed the system clock
+    #   WRITTEN → on every NTP sync (via on_time_sync above) to persist time
+    # The ESP32 internal timer keeps ticking between syncs, so the clock
+    # remains valid even after WiFi drops (until the next reboot without NTP).
+    update_interval: never
+
+################################################################################
+# Global runtime state for the timer  (not persisted – reset on reboot)
+################################################################################
+globals:
+  - id: g_counter           # seconds elapsed in the current phase
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: g_phase             # 0 = OFF-phase running, 1 = ON-phase running
+    type: int
+    restore_value: no
+    initial_value: '0'      # start in OFF-phase → first action is to turn ON
+
+################################################################################
+# Configurable timer parameters  (restored from flash after reboot)
+################################################################################
+number:
+  # ── How long relays stay ON ──────────────────────────────────────────────
+  - platform: template
+    name: "ON Duration"
+    id: on_duration
+    icon: mdi:timer-play-outline
+    unit_of_measurement: min
+    min_value: 0.5
+    max_value: 120
+    step: 0.5
+    initial_value: 2
+    restore_value: true
+    optimistic: true
+    mode: box
+    on_value:             # reset timer cycle whenever a parameter changes
+      then:
+        - globals.set:
+            id: g_counter
+            value: '0'
+        - globals.set:
+            id: g_phase
+            value: '0'
+
+  # ── How long relays stay OFF ─────────────────────────────────────────────
+  - platform: template
+    name: "OFF Duration"
+    id: off_duration
+    icon: mdi:timer-pause-outline
+    unit_of_measurement: min
+    min_value: 0.5
+    max_value: 120
+    step: 0.5
+    initial_value: 3
+    restore_value: true
+    optimistic: true
+    mode: box
+    on_value:
+      then:
+        - globals.set:
+            id: g_counter
+            value: '0'
+        - globals.set:
+            id: g_phase
+            value: '0'
+
+  # ── Daytime window start (inclusive) ────────────────────────────────────
+  - platform: template
+    name: "Daytime Start"
+    id: day_start
+    icon: mdi:weather-sunset-up
+    unit_of_measurement: h
+    min_value: 0
+    max_value: 23
+    step: 1
+    initial_value: 6
+    restore_value: true
+    optimistic: true
+    mode: box
+
+  # ── Daytime window end (exclusive) ──────────────────────────────────────
+  - platform: template
+    name: "Daytime End"
+    id: day_end
+    icon: mdi:weather-sunset-down
+    unit_of_measurement: h
+    min_value: 0
+    max_value: 23
+    step: 1
+    initial_value: 22
+    restore_value: true
+    optimistic: true
+    mode: box
+
+################################################################################
+# Switches
+################################################################################
+switch:
+  # ── Timer master enable (shown on web page as a prominent toggle) ─────────
+  - platform: template
+    name: "Timer Enable"
+    id: timer_enable
+    icon: mdi:timer-check
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+    turn_on_action:           # reset to fresh cycle when re-enabled
+      then:
+        - globals.set:
+            id: g_counter
+            value: '0'
+        - globals.set:
+            id: g_phase
+            value: '0'
+    turn_off_action:          # immediately cut relays when disabled
+      then:
+        - switch.turn_off: relay_1
+        - switch.turn_off: relay_2
+        - globals.set:
+            id: g_counter
+            value: '0'
+        - globals.set:
+            id: g_phase
+            value: '0'
+
+  # ── Relay 1 & 2  (controlled by the timer logic below) ───────────────────
+  - platform: gpio
+    name: "Relay 1"
+    id: relay_1
+    pin:
+      pcf8574: exp_outputs
+      number: 0
+      mode: OUTPUT
+      inverted: true
+
+  - platform: gpio
+    name: "Relay 2"
+    id: relay_2
+    pin:
+      pcf8574: exp_outputs
+      number: 1
+      mode: OUTPUT
+      inverted: true
+
+  # ── Relay 3–6  (manual / independent) ────────────────────────────────────
+  - platform: gpio
+    name: "Relay 3"
+    id: relay_3
+    pin:
+      pcf8574: exp_outputs
+      number: 2
+      mode: OUTPUT
+      inverted: true
+
+  - platform: gpio
+    name: "Relay 4"
+    id: relay_4
+    pin:
+      pcf8574: exp_outputs
+      number: 3
+      mode: OUTPUT
+      inverted: true
+
+  - platform: gpio
+    name: "Relay 5"
+    id: relay_5
+    pin:
+      pcf8574: exp_outputs
+      number: 4
+      mode: OUTPUT
+      inverted: true
+
+  - platform: gpio
+    name: "Relay 6"
+    id: relay_6
+    pin:
+      pcf8574: exp_outputs
+      number: 5
+      mode: OUTPUT
+      inverted: true
+
+################################################################################
+# Digital inputs  (read-only status on web page)
+################################################################################
+binary_sensor:
+  - platform: gpio
+    name: "Input 1"
+    pin:
+      pcf8574: exp_inputs
+      number: 0
+      mode: INPUT
+      inverted: true
+
+  - platform: gpio
+    name: "Input 2"
+    pin:
+      pcf8574: exp_inputs
+      number: 1
+      mode: INPUT
+      inverted: true
+
+  - platform: gpio
+    name: "Input 3"
+    pin:
+      pcf8574: exp_inputs
+      number: 2
+      mode: INPUT
+      inverted: true
+
+  - platform: gpio
+    name: "Input 4"
+    pin:
+      pcf8574: exp_inputs
+      number: 3
+      mode: INPUT
+      inverted: true
+
+  - platform: gpio
+    name: "Input 5"
+    pin:
+      pcf8574: exp_inputs
+      number: 4
+      mode: INPUT
+      inverted: true
+
+  - platform: gpio
+    name: "Input 6"
+    pin:
+      pcf8574: exp_inputs
+      number: 5
+      mode: INPUT
+      inverted: true
+
+################################################################################
+# 1-Wire buses for DS18B20 temperature sensors
+#   GPIO32 – 1-Wire IO-1  (on-board header)
+#   GPIO33 – 1-Wire IO-2  (on-board header)
+# Connect one DS18B20 per bus; 4.7 kΩ pull-up to 3.3 V required on each line.
+################################################################################
+one_wire:
+  - platform: gpio
+    pin: GPIO32
+    id: ow_bus_1
+  - platform: gpio
+    pin: GPIO33
+    id: ow_bus_2
+
+################################################################################
+# Status / diagnostic information shown on web page
+################################################################################
+text_sensor:
+  # ── Live clock display (ticks every second) ──────────────────────────────
+  - platform: template
+    name: "Current Time"
+    id: current_time_display
+    icon: mdi:clock-outline
+    update_interval: 1s
+    lambda: |-
+      auto t = id(ntp_time).now();
+      if (!t.is_valid()) t = id(rtc_time).now();
+      if (!t.is_valid()) return {"--:--:--"};
+      char buf[32];
+      snprintf(buf, sizeof(buf), "%04d-%02d-%02d  %02d:%02d:%02d",
+               t.year, t.month, t.day_of_month,
+               t.hour, t.minute, t.second);
+      return {std::string(buf)};
+
+  # ── Which time source is currently active ────────────────────────────────
+  - platform: template
+    name: "Time Source"
+    id: time_source_display
+    icon: mdi:clock-check-outline
+    update_interval: 10s
+    lambda: |-
+      if (id(ntp_time).now().is_valid()) return {"NTP (synced)"};
+      if (id(rtc_time).now().is_valid()) return {"RTC (no WiFi)"};
+      return {"No time source"};
+
+  - platform: template
+    name: "Timer Status"
+    id: timer_status
+    icon: mdi:information-outline
+    lambda: return {};          # updated every second by the interval below
+    update_interval: never
+
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+      icon: mdi:ip-network
+    ssid:
+      name: "Connected SSID"
+      icon: mdi:wifi
+
+sensor:
+  # ── DS18B20 temperature sensors ──────────────────────────────────────────
+  # Sensor on GPIO32 (1-Wire IO-1)
+  - platform: dallas_temp
+    one_wire_id: ow_bus_1
+    name: "Temperature 1"
+    id: temp_sensor_1
+    icon: mdi:thermometer
+    accuracy_decimals: 1
+    update_interval: 30s
+
+  # Sensor on GPIO33 (1-Wire IO-2)
+  - platform: dallas_temp
+    one_wire_id: ow_bus_2
+    name: "Temperature 2"
+    id: temp_sensor_2
+    icon: mdi:thermometer
+    accuracy_decimals: 1
+    update_interval: 30s
+
+  - platform: template
+    name: "Timer Phase Remaining"
+    id: timer_remaining
+    icon: mdi:timer-sand
+    unit_of_measurement: s
+    accuracy_decimals: 0
+    update_interval: never      # pushed every second by the interval below
+
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 30s
+
+  - platform: uptime
+    name: "Uptime"
+    update_interval: 60s
+
+################################################################################
+# ─── Core timer logic  (runs every second) ───────────────────────────────────
+#
+# State machine:
+#
+#   ┌─── OFF phase ───────────────────────────────────┐
+#   │  relays OFF, count to off_duration              │
+#   │  → when counter ≥ off_secs  →  switch to ON    │
+#   └─────────────────────────────────────────────────┘
+#        ↑                              ↓
+#   ┌─── ON phase ────────────────────────────────────┐
+#   │  relays ON,  count to on_duration               │
+#   │  → when counter ≥ on_secs   →  switch to OFF   │
+#   └─────────────────────────────────────────────────┘
+#
+# Both phases are paused (relays forced OFF, counter reset) outside the
+# configured daytime window.
+################################################################################
+interval:
+  - interval: 1s
+    then:
+      - lambda: |-
+
+          // ── 1. Timer disabled ──────────────────────────────────────────
+          if (!id(timer_enable).state) {
+            id(timer_status).publish_state("Disabled");
+            return;
+          }
+
+          // ── 2. Require a valid time source (NTP first, RTC fallback) ─────
+          auto t = id(ntp_time).now();
+          if (!t.is_valid()) t = id(rtc_time).now();   // use RTC if NTP not yet synced
+          if (!t.is_valid()) {
+            id(timer_status).publish_state("Waiting for time sync…");
+            return;
+          }
+
+          // ── 3. Daytime window check ─────────────────────────────────────
+          int hour    = t.hour;
+          int t_start = (int) id(day_start).state;
+          int t_end   = (int) id(day_end).state;
+
+          bool daytime;
+          if (t_start < t_end) {
+            // Normal window: e.g. 06:00 – 22:00
+            daytime = (hour >= t_start && hour < t_end);
+          } else {
+            // Overnight window: e.g. 22:00 – 06:00
+            daytime = (hour >= t_start || hour < t_end);
+          }
+
+          if (!daytime) {
+            // Outside daytime window – force relays OFF, reset cycle
+            if (id(relay_1).state) id(relay_1).turn_off();
+            if (id(relay_2).state) id(relay_2).turn_off();
+            id(g_counter) = 0;
+            id(g_phase)   = 0;
+
+            char buf[64];
+            snprintf(buf, sizeof(buf),
+                     "Nighttime  (timer active %02d:00 – %02d:00)",
+                     t_start, t_end);
+            id(timer_status).publish_state(buf);
+            return;
+          }
+
+          // ── 4. Advance the phase counter ───────────────────────────────
+          id(g_counter)++;
+
+          if (id(g_phase) == 1) {
+            // ────────── ON phase: relays energised ──────────────────────
+            if (!id(relay_1).state) id(relay_1).turn_on();
+            if (!id(relay_2).state) id(relay_2).turn_on();
+
+            int on_secs   = (int)(id(on_duration).state * 60.0f);
+            int remaining = on_secs - id(g_counter);
+            id(timer_remaining).publish_state((float) remaining);
+
+            char buf[64];
+            snprintf(buf, sizeof(buf),
+                     "ON  –  %d s remaining  (%d min total)",
+                     remaining, on_secs / 60);
+            id(timer_status).publish_state(buf);
+
+            if (id(g_counter) >= on_secs) {
+              // ON phase complete → switch to OFF phase
+              id(relay_1).turn_off();
+              id(relay_2).turn_off();
+              id(g_phase)   = 0;
+              id(g_counter) = 0;
+            }
+
+          } else {
+            // ────────── OFF phase: relays de-energised ───────────────────
+            if (id(relay_1).state)  id(relay_1).turn_off();
+            if (id(relay_2).state)  id(relay_2).turn_off();
+
+            int off_secs  = (int)(id(off_duration).state * 60.0f);
+            int remaining = off_secs - id(g_counter);
+            id(timer_remaining).publish_state((float) remaining);
+
+            char buf[64];
+            snprintf(buf, sizeof(buf),
+                     "OFF  –  %d s remaining  (%d min total)",
+                     remaining, off_secs / 60);
+            id(timer_status).publish_state(buf);
+
+            if (id(g_counter) >= off_secs) {
+              // OFF phase complete → switch to ON phase
+              id(relay_1).turn_on();
+              id(relay_2).turn_on();
+              id(g_phase)   = 1;
+              id(g_counter) = 0;
+            }
+          }
